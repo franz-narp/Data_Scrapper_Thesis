@@ -1,0 +1,4 @@
+# Davao Flood Facebook Scraper — Dependencies
+undetected-chromedriver>=3.5.5
+selenium>=4.15.0
+pandas>=2.0.0
