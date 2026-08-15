@@ -28,6 +28,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import hashlib
 import json
@@ -35,6 +36,7 @@ import logging
 import os
 import random
 import re
+import signal
 import sys
 import time
 from dataclasses import dataclass, field, asdict
@@ -85,45 +87,36 @@ DAVAO_AREAS: list[str] = [
 
 SEARCH_QUERIES: list[str] = [
     # General flood + Davao
-    "baha",
     "baha davao",
-    "baha davao city",
-    "lunop davao",
-    "nagbaha davao",
-    "flood davao city",
-    "flooding davao",
-    "taas ang tubig davao",
-    "lapok davao",
-    # Rescue & urgency
-    "rescue baha davao",
-    "rescue flood davao",
-    "stranded baha davao",
-    "evacuation davao flood",
-    "tabang baha davao",
-    "tulong baha davao",
-    # Area-specific searches
-    "baha Matina Pangi",
-    "baha Matina Crossing",
-    "baha Buhangin davao",
-    "baha Bangkal davao",
-    "baha Bucana davao",
-    "baha Tigatto davao",
-    "baha Bunawan davao",
-    "baha Talomo davao",
-    "baha Ma-a davao",
-    "flood Jade Valley davao",
-    # Situational reports
-    "CDRRMO davao flood",
-    "davao flood update",
-    "davao flood advisory",
+    # "flood davao ",
+    # "taas ang tubig davao",
+
+    # Rescue & urgency          Commented out as of the momment for faster data gathering at the moment
+    # "rescue flood davao",
+    # "stranded flood davao",
+    # "evacuation flood davao",
+
+    # Area-specific searches     Commented out as of the momment for faster data gathering at the moment
+    # "baha Matina Pangi",
+    # "baha Matina Crossing",
+    # "baha Buhangin davao",
+    # "baha Bangkal davao",
+    # "baha Bucana davao",
+    # "baha Tigatto davao",
+    # "baha Bunawan davao",
+    # "baha Talomo davao",
+    # "baha Ma-a davao",
+    # "flood Jade Valley davao",
+
+    # Situational reports       Commented out as of the momment for faster data gathering at the moment
+    # "CDRRMO davao flood",
+    # "davao flood update",
+    # "davao flood advisory",
 ]
 
 # "See more" button labels (includes Bisaya/Cebuano localizations)
 SEE_MORE_LABELS: list[str] = [
     "See more", "See More",
-    "Tan-awa ang dugang",                                     # Cebuano
-    "Tingnan ang Iba Pa",                                     # Filipino
-    "Ver más",                                                # Spanish (rare)
 ]
 
 # ──────────────────────────────────────────────
@@ -395,13 +388,20 @@ def extract_posts_from_page(
     driver,
     seen_hashes: set[str],
     seen_urls: set[str],
+    all_reports: list[FloodReport],
+    json_path: Path,
+    csv_path: Path,
     max_scrolls: int = 50,
-) -> list[FloodReport]:
-    """Scroll the current page and extract flood-relevant posts."""
+) -> int:
+    """Scroll the current page, extract flood-relevant posts, and save
+    each one to disk the moment it is found.
 
-    reports: list[FloodReport] = []
+    Returns the number of *new* posts found on this page.
+    """
+
+    new_count = 0
     stale_rounds = 0
-    prev_count = 0
+    prev_total = len(all_reports)
 
     for scroll_i in range(max_scrolls):
         _smooth_scroll(driver, pixels=random.randint(700, 1200))
@@ -412,7 +412,7 @@ def extract_posts_from_page(
             # Fallback: try broader selectors used in some FB layouts
             articles = driver.find_elements(By.CSS_SELECTOR, '[data-ad-preview], .userContentWrapper')
 
-        log.info(f"  scroll {scroll_i + 1}/{max_scrolls} — {len(articles)} article(s) visible")
+        log.info(f"  scroll {scroll_i + 1}/{max_scrolls} — {len(articles)} article(s) visible  |  total saved: {len(all_reports)}")
 
         for article in articles:
             try:
@@ -453,11 +453,16 @@ def extract_posts_from_page(
                     post_url=permalink,
                     scraped_at=datetime.now(timezone.utc).isoformat(),
                 )
-                reports.append(report)
+                all_reports.append(report)
+                new_count += 1
                 log.info(
                     f"    ★ [{report.urgency_level}] {report.author[:30]} — "
-                    f"locations: {report.detected_locations or '—'}"
+                    f"locations: {report.detected_locations or '—'}  "
+                    f"(#{len(all_reports)} total)"
                 )
+
+                # ── INCREMENTAL SAVE: write to disk immediately ──
+                save_incremental(all_reports, json_path, csv_path)
 
             except StaleElementReferenceException:
                 continue
@@ -466,35 +471,42 @@ def extract_posts_from_page(
                 continue
 
         # Staleness detection: stop scrolling if no new posts appear
-        if len(reports) == prev_count:
+        if len(all_reports) == prev_total:
             stale_rounds += 1
             if stale_rounds >= 5:
                 log.info("  No new posts in 5 consecutive scrolls — stopping early.")
                 break
         else:
             stale_rounds = 0
-            prev_count = len(reports)
+            prev_total = len(all_reports)
 
-    return reports
+    return new_count
 
 # ──────────────────────────────────────────────
 # Output writers
 # ──────────────────────────────────────────────
 
 def save_json(reports: list[FloodReport], path: Path) -> None:
+    """Write the full reports list to JSON (overwrites)."""
     data = [asdict(r) for r in reports]
-    with open(path, "w", encoding="utf-8") as f:
+    # Write to a temp file first, then rename — protects against
+    # half-written files if power dies mid-write.
+    tmp_path = path.with_suffix(".json.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    log.info(f"Saved {len(reports)} reports → {path}")
+    tmp_path.replace(path)
+    log.info(f"💾 Saved {len(reports)} reports → {path}")
 
 
 def save_csv(reports: list[FloodReport], path: Path) -> None:
+    """Write the full reports list to CSV (overwrites)."""
     if not reports:
         log.warning("No reports to write to CSV.")
         return
 
     fieldnames = list(asdict(reports[0]).keys())
-    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+    tmp_path = path.with_suffix(".csv.tmp")
+    with open(tmp_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for r in reports:
@@ -503,7 +515,45 @@ def save_csv(reports: list[FloodReport], path: Path) -> None:
             row["media_urls"] = "; ".join(row["media_urls"])
             row["detected_locations"] = "; ".join(row["detected_locations"])
             writer.writerow(row)
-    log.info(f"Saved {len(reports)} reports → {path}")
+    tmp_path.replace(path)
+    log.info(f"💾 Saved {len(reports)} reports → {path}")
+
+
+def save_incremental(all_reports: list[FloodReport], json_path: Path, csv_path: Path) -> None:
+    """Save all accumulated reports to both JSON and CSV right now."""
+    if all_reports:
+        save_json(all_reports, json_path)
+        save_csv(all_reports, csv_path)
+
+
+def load_existing_reports(json_path: Path) -> tuple[list[FloodReport], set[str], set[str]]:
+    """Load previously saved reports so the scraper can resume after a
+    crash, power loss, or manual stop without losing data."""
+    reports: list[FloodReport] = []
+    seen_hashes: set[str] = set()
+    seen_urls: set[str] = set()
+
+    if not json_path.exists():
+        return reports, seen_hashes, seen_urls
+
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for item in data:
+            # Reconstruct FloodReport from dict
+            report = FloodReport(**item)
+            reports.append(report)
+            seen_hashes.add(report.post_id)  # post_id is the hash[:12]
+            # Also add the full hash of the text
+            seen_hashes.add(_hash_text(report.full_text[:500]))
+            if report.post_url:
+                seen_urls.add(report.post_url)
+        log.info(f"📂 Loaded {len(reports)} existing reports from {json_path} — will resume from where we left off.")
+    except (json.JSONDecodeError, TypeError, KeyError) as exc:
+        log.warning(f"⚠ Could not load existing reports ({exc}). Starting fresh.")
+        reports, seen_hashes, seen_urls = [], set(), set()
+
+    return reports, seen_hashes, seen_urls
 
 # ──────────────────────────────────────────────
 # Orchestration
@@ -515,29 +565,37 @@ def scrape_search_queries(
     seen_hashes: set[str],
     seen_urls: set[str],
     max_scrolls: int,
-) -> list[FloodReport]:
-    """Iterate through Facebook search-post URLs for each query."""
-    all_reports: list[FloodReport] = []
+    all_reports: list[FloodReport],
+    json_path: Path,
+    csv_path: Path,
+) -> None:
+    """Iterate through Facebook search-post URLs for each query.
+    Posts are saved incrementally inside extract_posts_from_page."""
 
-    for query in queries:
+    for i, query in enumerate(queries, 1):
         url = _build_search_url(query)
-        log.info(f"▶ Searching: \"{query}\"  →  {url}")
+        log.info(f"▶ [{i}/{len(queries)}] Searching: \"{query}\"  →  {url}")
         try:
             driver.get(url)
             _human_pause(4, 7)
 
-            # Sometimes Facebook shows a "Log In" overlay on search pages;
-            # dismiss it if present.
+            # Dismiss login overlay if present
             _dismiss_login_overlay(driver)
 
-            reports = extract_posts_from_page(driver, seen_hashes, seen_urls, max_scrolls)
-            all_reports.extend(reports)
-            log.info(f"  ✓ Collected {len(reports)} new posts for query \"{query}\"")
+            new_count = extract_posts_from_page(
+                driver, seen_hashes, seen_urls,
+                all_reports, json_path, csv_path,
+                max_scrolls,
+            )
+            log.info(f"  ✓ +{new_count} new posts for \"{query}\"  |  Grand total: {len(all_reports)}")
+
+        except KeyboardInterrupt:
+            log.warning("\n[!] Ctrl+C detected. Data already saved incrementally.")
+            raise
         except WebDriverException as exc:
             log.error(f"  ✗ Failed on query \"{query}\": {exc}")
+            # Even on failure, data so far is already on disk
         _human_pause(3, 6)
-
-    return all_reports
 
 
 
@@ -624,9 +682,27 @@ def main() -> None:
     log.info(f"  Scrolls/page: {args.scrolls}")
     log.info("=" * 60)
 
+    # ── Load any previously saved reports (resume support) ──
+    all_reports, seen_hashes, seen_urls = load_existing_reports(json_path)
+    if all_reports:
+        log.info(f"  Resuming with {len(all_reports)} previously saved reports.")
+
     # ── Launch browser ──
     headless = args.headless and not args.login
     driver = create_driver(profile_dir, headless=headless)
+
+    # Register an emergency save handler so that even if the process is
+    # killed (e.g. terminal closed, SIGTERM), we attempt a final save.
+    def _emergency_save(*_args):
+        log.warning("\n🚨 Emergency save triggered (signal/atexit)…")
+        save_incremental(all_reports, json_path, csv_path)
+
+    atexit.register(_emergency_save)
+    # SIGTERM (sent when terminal is closed on some systems)
+    try:
+        signal.signal(signal.SIGTERM, lambda *_: (_emergency_save(), sys.exit(0)))
+    except (OSError, ValueError):
+        pass  # Not available on all platforms / threads
 
     try:
         # ── Login flow ──
@@ -650,19 +726,14 @@ def main() -> None:
                 )
                 return
 
-        # ── Deduplication state ──
-        seen_hashes: set[str] = set()
-        seen_urls: set[str] = set()
-        all_reports: list[FloodReport] = []
-
         # ── Search-based discovery ──
         log.info("\n━━━ Searching for Davao flood posts ━━━")
-        search_reports = scrape_search_queries(
-            driver, SEARCH_QUERIES, seen_hashes, seen_urls, args.scrolls
+        scrape_search_queries(
+            driver, SEARCH_QUERIES, seen_hashes, seen_urls,
+            args.scrolls, all_reports, json_path, csv_path,
         )
-        all_reports.extend(search_reports)
 
-        # ── Summary & save ──
+        # ── Final summary ──
         log.info("\n" + "=" * 60)
         log.info(f"  Total flood reports collected: {len(all_reports)}")
         sitrep = sum(1 for r in all_reports if r.urgency_level == "SITREP")
@@ -670,25 +741,25 @@ def main() -> None:
         log.info(f"  SITREP: {sitrep}  |  HIGH: {high}  |  NORMAL: {len(all_reports) - sitrep - high}")
         log.info("=" * 60)
 
-        if all_reports:
-            save_json(all_reports, json_path)
-            save_csv(all_reports, csv_path)
-        else:
+        # One last save to be sure
+        save_incremental(all_reports, json_path, csv_path)
+
+        if not all_reports:
             log.warning("No flood-related posts were found during this run.")
 
     except KeyboardInterrupt:
-        log.info("\nInterrupted by user. Saving partial results…")
-        if "all_reports" in dir() and all_reports:
-            save_json(all_reports, json_path)
-            save_csv(all_reports, csv_path)
+        log.info("\n⏹ Interrupted by user. Data already saved incrementally — nothing lost.")
+        save_incremental(all_reports, json_path, csv_path)
     except Exception as exc:
         log.exception(f"Unexpected error: {exc}")
+        # Save whatever we have before crashing
+        save_incremental(all_reports, json_path, csv_path)
     finally:
         try:
             driver.quit()
         except Exception:
             pass
-        log.info("Browser closed. Done.")
+        log.info(f"Browser closed. Done. Total reports on disk: {len(all_reports)}")
 
 
 if __name__ == "__main__":
