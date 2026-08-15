@@ -227,7 +227,7 @@ def create_driver(profile_dir: str, *, headless: bool = False) -> uc.Chrome:
         options.add_argument("--headless=new")
         options.add_argument("--window-size=1920,1080")
 
-    driver = uc.Chrome(options=options, use_subprocess=True)
+    driver = uc.Chrome(options=options, version_main=151, use_subprocess=True)
     driver.set_page_load_timeout(60)
     driver.implicitly_wait(5)
     return driver
