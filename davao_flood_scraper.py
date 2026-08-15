@@ -43,7 +43,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Set
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus, urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -126,13 +126,13 @@ SEE_MORE_LABELS: list[str] = [
 @dataclass
 class FloodReport:
     post_id: str = ""
+    post_url: str = ""
+    author: str = "Unknown"
     timestamp: str = ""
-    author: str = ""
     full_text: str = ""
-    media_urls: List[str] = field(default_factory=list)
     detected_locations: List[str] = field(default_factory=list)
     urgency_level: str = "NORMAL"          # NORMAL | HIGH | SITREP
-    post_url: str = ""
+    media_urls: List[str] = field(default_factory=list)
     scraped_at: str = ""
 
 # ──────────────────────────────────────────────
@@ -316,72 +316,235 @@ def _extract_media_urls(article) -> list[str]:
     return list(dict.fromkeys(urls))  # deduplicate
 
 
-def _extract_permalink(driver, article) -> str:
-    """Attempt to extract a permalink / post URL from timestamp links."""
+def _clean_facebook_url(url: str) -> str:
+    """Clean tracking params from Facebook URL while preserving essential post identifiers."""
+    if not url:
+        return ""
+    if url.startswith("/"):
+        url = "https://www.facebook.com" + url
+
     try:
-        # Post timestamps are usually <a> links with href containing /posts/ or /permalink/
+        parsed = urlparse(url)
+        # If it's a php script with query params, preserve essential identifiers
+        if any(p in parsed.path for p in ["permalink.php", "story.php", "photo.php", "video.php", "watch"]):
+            query_params = parse_qs(parsed.query)
+            essential_keys = ["story_fbid", "id", "fbid", "v", "comment_id", "theater", "set"]
+            kept = {k: v[0] for k, v in query_params.items() if k in essential_keys and v}
+            clean_query = urlencode(kept)
+            return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", clean_query, ""))
+        else:
+            # Clean path URL: strip ?__cft__... and tracking parameters
+            clean_path = parsed.path.rstrip("/")
+            return urlunparse((parsed.scheme, parsed.netloc, clean_path, "", "", ""))
+    except Exception:
+        return url.split("?")[0]
+
+
+def _is_valid_author(name: str) -> bool:
+    """Validate that the string is a real poster/page name, not a hashtag or UI label."""
+    if not name or len(name) < 2 or len(name) > 90:
+        return False
+    t = name.strip()
+    if t.startswith("#") or t.startswith("http") or t.startswith("@"):
+        return False
+
+    lowered = t.lower()
+    invalid_keywords = [
+        "see more", "see less", "like", "comment", "share", "follow", "facebook",
+        "public", "joined", "replies", "reaction", "suggested", "sponsored",
+        "tan-awa", "tingnan", "photos", "videos", "groups", "reels",
+        "top fans", "following", "admin", "moderator", "unknown", "shared with",
+        "news feed", "write a comment", "log in", "sign up", "notifications"
+    ]
+    if any(bad == lowered or lowered.startswith(bad) for bad in invalid_keywords):
+        return False
+
+    return True
+
+
+def _is_valid_timestamp(text: str) -> bool:
+    """Validate whether text is a plausible date/time string and NOT a hashtag or username."""
+    if not text or len(text) > 75:
+        return False
+    t = text.strip()
+    if t.startswith("#") or t.startswith("http") or t.startswith("@"):
+        return False
+
+    # Reject common UI labels
+    lowered = t.lower()
+    if any(bad in lowered for bad in [
+        "see more", "see less", "like", "comment", "share", "follow", "facebook",
+        "public", "joined", "replies", "reaction", "author", "suggested",
+        "sponsored", "view more", "hide", "tan-awa", "tingnan", "unknown"
+    ]):
+        return False
+
+    # Check for date / time patterns
+    date_patterns = [
+        r'\b(?:just now|yesterday|today|kahapon)\b',
+        r'\b\d+\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|wk|wks|week|weeks|y|yr|yrs|year|years)(?:\s+ago)?\b',
+        r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}(?:,?\s+\d{4})?\b',
+        r'\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?(?:\s+\d{4})?\b',
+        r'\b\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)?\b',
+        r'\b\d{4}-\d{2}-\d{2}\b',
+        r'\b(?:hulyo|agosto|setyembre|oktubre|nobiyembre|disyembre|enero|pebrero|marso|abril|mayo|hunyo)\s+\d{1,2}\b',
+    ]
+    return any(re.search(pat, t, re.IGNORECASE) for pat in date_patterns)
+
+
+def _extract_author(driver, article) -> str:
+    """Best-effort extraction of the posting author's name, avoiding hashtags."""
+    # 1. Look for headings (h2, h3, h4, h5, [role="heading"])
+    try:
+        headings = article.find_elements(By.CSS_SELECTOR, 'h2, h3, h4, h5, [role="heading"]')
+        for heading in headings:
+            links = heading.find_elements(By.CSS_SELECTOR, "a")
+            for link in links:
+                txt = link.text.strip() or (link.get_attribute("innerText") or "").strip()
+                if _is_valid_author(txt):
+                    return txt
+            txt = heading.text.strip() or (heading.get_attribute("innerText") or "").strip()
+            first_line = txt.split("\n")[0].strip() if txt else ""
+            if _is_valid_author(first_line):
+                return first_line
+    except Exception:
+        pass
+
+    # 2. Look for profile link in the header area (excluding hashtags/posts/photos)
+    try:
         links = article.find_elements(By.CSS_SELECTOR, "a[href]")
         for link in links:
             href = link.get_attribute("href") or ""
-            if any(seg in href for seg in ["/posts/", "/permalink/", "/photo/", "/videos/", "story_fbid"]):
-                # Clean tracking parameters
-                clean = href.split("?")[0]
-                return clean
+            if any(seg in href for seg in [
+                "/hashtag/", "/posts/", "/permalink", "/photo", "/video", "/watch",
+                "/reel", "/events/", "/login", "/recover", "/help", "/sharer", "/friends"
+            ]):
+                continue
+
+            txt = link.text.strip() or (link.get_attribute("innerText") or "").strip()
+            if _is_valid_author(txt):
+                return txt
+            aria = (link.get_attribute("aria-label") or "").strip()
+            if _is_valid_author(aria):
+                return aria
     except Exception:
         pass
-    return ""
 
-
-def _extract_author(article) -> str:
-    """Best-effort extraction of the posting author's name."""
+    # 3. Look for Profile picture alt text / aria-label
     try:
-        # The author name is typically the first strong/heading link inside the article
-        heading = article.find_element(By.CSS_SELECTOR, "strong, h2, h3, h4")
-        return heading.text.strip()
-    except NoSuchElementException:
-        pass
-    try:
-        # Fallback: first link with a user/page profile href
-        links = article.find_elements(By.CSS_SELECTOR, "a[href]")
-        for link in links:
-            href = link.get_attribute("href") or ""
-            text = link.text.strip()
-            if text and len(text) > 1 and ("facebook.com/" in href) and "/posts/" not in href:
-                return text
+        imgs = article.find_elements(By.CSS_SELECTOR, 'img[alt*="profile" i], img[alt*="profile picture" i]')
+        for img in imgs:
+            alt = (img.get_attribute("alt") or "").strip()
+            cleaned = re.sub(r"(?:'s\s+profile\s+picture|profile\s+picture\s+of\s+|profile\s+of\s+)", "", alt, flags=re.I).strip()
+            if _is_valid_author(cleaned):
+                return cleaned
     except Exception:
         pass
+
     return "Unknown"
 
 
-def _extract_timestamp(article) -> str:
-    """Extract the human-readable timestamp string from the post."""
+def _extract_timestamp_and_url(driver, article, full_text: str = "") -> tuple[str, str]:
+    """Extract publish timestamp and direct post permalink."""
+    timestamp = ""
+    post_url = ""
+
+    # Strategy 1: Find post permalink and timestamp from post links
     try:
-        # Facebook often stores timestamps in <abbr> or aria-label on timestamp links
-        abbr_tags = article.find_elements(By.TAG_NAME, "abbr")
-        for abbr in abbr_tags:
-            ts = abbr.get_attribute("data-utime") or abbr.get_attribute("title") or abbr.text
-            if ts:
-                return ts.strip()
+        links = article.find_elements(By.CSS_SELECTOR, "a[href]")
+        for link in links:
+            href = link.get_attribute("href") or ""
+            if not href or "/hashtag/" in href:
+                continue
+
+            is_post_link = any(seg in href for seg in [
+                "/posts/", "/permalink", "story_fbid=", "/videos/", "/watch",
+                "/reel/", "photo.php", "story.php", "fbid="
+            ])
+
+            aria = (link.get_attribute("aria-label") or "").strip()
+            title = (link.get_attribute("title") or "").strip()
+            inner = (link.get_attribute("innerText") or link.text or "").strip()
+            data_utime = link.get_attribute("data-utime")
+
+            found_ts = ""
+            if data_utime and data_utime.isdigit():
+                try:
+                    found_ts = datetime.fromtimestamp(int(data_utime), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    pass
+            elif _is_valid_timestamp(aria):
+                found_ts = aria
+            elif _is_valid_timestamp(title):
+                found_ts = title
+            elif _is_valid_timestamp(inner):
+                found_ts = inner
+
+            if found_ts and not timestamp:
+                timestamp = found_ts
+
+            if is_post_link and not post_url:
+                post_url = _clean_facebook_url(href)
+
+            if timestamp and post_url:
+                break
     except Exception:
         pass
 
-    try:
-        # Modern FB uses aria-label on the timestamp <a> element
-        time_links = article.find_elements(
-            By.CSS_SELECTOR, 'a[href*="/posts/"], a[href*="permalink"], a[role="link"]'
+    # Strategy 2: Check <abbr> tags for timestamp
+    if not timestamp:
+        try:
+            abbrs = article.find_elements(By.TAG_NAME, "abbr")
+            for abbr in abbrs:
+                ts = abbr.get_attribute("data-utime") or abbr.get_attribute("title") or abbr.text
+                if ts:
+                    if ts.isdigit():
+                        try:
+                            timestamp = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                            break
+                        except Exception:
+                            pass
+                    elif _is_valid_timestamp(ts):
+                        timestamp = ts.strip()
+                        break
+        except Exception:
+            pass
+
+    # Strategy 3: Hover over header time link to reveal Facebook tooltip
+    if not timestamp or any(rel in timestamp.lower() for rel in ["hr", "min", "ago", "yesterday", "d", "h", "m", "just now"]):
+        try:
+            header_links = article.find_elements(
+                By.CSS_SELECTOR, 'a[role="link"][href*="/posts/"], a[role="link"][href*="permalink"], span > a[role="link"]'
+            )
+            for hl in header_links[:2]:
+                try:
+                    ActionChains(driver).move_to_element(hl).perform()
+                    time.sleep(0.25)
+                    tooltips = driver.find_elements(By.CSS_SELECTOR, 'div[role="tooltip"], div[data-visualcompletion="tooltip-target"]')
+                    for tt in tooltips:
+                        t = tt.text.strip()
+                        if _is_valid_timestamp(t) and any(c.isdigit() for c in t):
+                            timestamp = t
+                            break
+                    if timestamp and not any(rel in timestamp.lower() for rel in ["ago", "hr", "min", "just now"]):
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Strategy 4: Fallback date extraction from post body text (e.g. "July 24, 2026", "Hulyo 24, 2026")
+    if not timestamp and full_text:
+        match = re.search(
+            r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December|'
+            r'Enero|Pebrero|Marso|Abril|Mayo|Hunyo|Hulyo|Agosto|Setyembre|Oktubre|Nobiyembre|Disyembre)\s+\d{1,2}(?:,?\s+\d{4})?\b',
+            full_text,
+            re.IGNORECASE
         )
-        for tl in time_links:
-            label = tl.get_attribute("aria-label") or ""
-            if label and any(c.isdigit() for c in label):
-                return label.strip()
-            # Sometimes the visible text is the relative timestamp
-            text = tl.text.strip()
-            if text and any(unit in text.lower() for unit in ["ago", "hr", "min", "yesterday", "just now", "h", "m", "d"]):
-                return text
-    except Exception:
-        pass
+        if match:
+            timestamp = match.group(0).strip()
 
-    return ""
+    return timestamp, post_url
 
 
 def extract_posts_from_page(
@@ -416,11 +579,6 @@ def extract_posts_from_page(
 
         for article in articles:
             try:
-                # Quick identity check via permalink
-                permalink = _extract_permalink(driver, article)
-                if permalink and permalink in seen_urls:
-                    continue
-
                 # Expand truncated text
                 _expand_see_more(driver, article)
 
@@ -437,27 +595,35 @@ def extract_posts_from_page(
                 if not _is_flood_relevant(full_text):
                     continue
 
+                # Extract metadata: Author, Timestamp, Post URL
+                timestamp, post_url = _extract_timestamp_and_url(driver, article, full_text)
+                author = _extract_author(driver, article)
+
+                if post_url and post_url in seen_urls:
+                    continue
+
                 # ── Build report ──
                 seen_hashes.add(text_hash)
-                if permalink:
-                    seen_urls.add(permalink)
+                if post_url:
+                    seen_urls.add(post_url)
 
                 report = FloodReport(
                     post_id=text_hash[:12],
-                    timestamp=_extract_timestamp(article),
-                    author=_extract_author(article),
+                    post_url=post_url,
+                    author=author,
+                    timestamp=timestamp,
                     full_text=full_text,
-                    media_urls=_extract_media_urls(article),
                     detected_locations=_detect_locations(full_text),
                     urgency_level=_classify_urgency(full_text),
-                    post_url=permalink,
+                    media_urls=_extract_media_urls(article),
                     scraped_at=datetime.now(timezone.utc).isoformat(),
                 )
                 all_reports.append(report)
                 new_count += 1
                 log.info(
-                    f"    ★ [{report.urgency_level}] {report.author[:30]} — "
-                    f"locations: {report.detected_locations or '—'}  "
+                    f"    ★ [{report.urgency_level}] {report.author[:25]} | "
+                    f"Date: {report.timestamp or 'N/A'} | "
+                    f"Link: {report.post_url or 'N/A'}  "
                     f"(#{len(all_reports)} total)"
                 )
 
@@ -504,10 +670,20 @@ def save_csv(reports: list[FloodReport], path: Path) -> None:
         log.warning("No reports to write to CSV.")
         return
 
-    fieldnames = list(asdict(reports[0]).keys())
+    fieldnames = [
+        "post_id",
+        "post_url",
+        "author",
+        "timestamp",
+        "full_text",
+        "detected_locations",
+        "urgency_level",
+        "media_urls",
+        "scraped_at",
+    ]
     tmp_path = path.with_suffix(".csv.tmp")
     with open(tmp_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for r in reports:
             row = asdict(r)
@@ -540,7 +716,12 @@ def load_existing_reports(json_path: Path) -> tuple[list[FloodReport], set[str],
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         for item in data:
-            # Reconstruct FloodReport from dict
+            # Clean up corrupted entries from previous buggy runs
+            if item.get("author", "").startswith("#"):
+                item["author"] = "Unknown"
+            if item.get("timestamp", "").startswith("#"):
+                item["timestamp"] = ""
+
             report = FloodReport(**item)
             reports.append(report)
             seen_hashes.add(report.post_id)  # post_id is the hash[:12]
