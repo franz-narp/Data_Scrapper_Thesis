@@ -64,15 +64,15 @@ from selenium.common.exceptions import (
 # ──────────────────────────────────────────────
 
 FLOOD_KEYWORDS: list[str] = [
-    "baha", "nagbaha", "lunop", "taas ang tubig", "suba",
-    "overflow", "inundated", "lapok", "baha sa davao",
+    "baha", "nagbaha", "lunod", "taas ang tubig", "suba", 
+    "sapa", "overflow", "lapok", "baha sa davao",
     "flood", "flooding", "flooded", "tubig",
 ]
 
 URGENCY_KEYWORDS: list[str] = [
     "tabang", "rescue", "stranded", "trap", "atop",
     "emergency", "tulong", "evacuation", "evacuate",
-    "nalimod", "saklolo", "help", "relief",
+    "nalumos", "saklolo", "help", "relief",
 ]
 
 DAVAO_AREAS: list[str] = [
