@@ -249,6 +249,172 @@ def ensure_logged_in(driver) -> bool:
 # Post extraction logic
 # ──────────────────────────────────────────────
 
+JS_EXTRACT_POST = """
+const card = arguments[0];
+
+function isValidAuthor(t) {
+    if (!t || t.length < 2 || t.length > 90) return false;
+    t = t.trim();
+    if (t.startsWith('#') || t.startsWith('http') || t.startsWith('@')) return false;
+    const low = t.toLowerCase();
+    const bad = [
+        'see more', 'see less', 'like', 'comment', 'share', 'follow', 'facebook',
+        'public', 'joined', 'replies', 'reaction', 'suggested', 'sponsored',
+        'tan-awa', 'tingnan', 'photos', 'videos', 'groups', 'reels',
+        'top fans', 'following', 'admin', 'moderator', 'unknown', 'shared with',
+        'news feed', 'write a comment', 'log in', 'sign up', 'notifications'
+    ];
+    return !bad.some(b => low === b || low.startsWith(b));
+}
+
+function isValidTimestamp(t) {
+    if (!t || t.length > 75) return false;
+    t = t.trim();
+    if (t.startsWith('#') || t.startsWith('http') || t.startsWith('@')) return false;
+    const low = t.toLowerCase();
+    const bad = ['see more', 'see less', 'like', 'comment', 'share', 'follow', 'facebook', 'public', 'joined', 'replies', 'reaction', 'author', 'suggested', 'sponsored', 'view more', 'hide', 'unknown'];
+    if (bad.some(b => low.includes(b))) return false;
+    const patterns = [
+        /\\b(?:just now|yesterday|today|kahapon)\\b/i,
+        /\\b\\d+\\s*(?:m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|wk|wks|week|weeks|y|yr|yrs|year|years)(?:\\s+ago)?\\b/i,
+        /\\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?\\s+\\d{1,2}(?:,?\\s+\\d{4})?\\b/i,
+        /\\b\\d{1,2}\\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\\.?(?:\\s+\\d{4})?\\b/i,
+        /\\b\\d{1,2}:\\d{2}\\s*(?:am|pm)?\\b/i,
+        /\\b\\d{4}-\\d{2}-\\d{2}\\b/,
+        /\\b(?:hulyo|agosto|setyembre|oktubre|nobiyembre|disyembre|enero|pebrero|marso|abril|mayo|hunyo)\\s+\\d{1,2}\\b/i,
+        /\\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i
+    ];
+    return patterns.some(p => p.test(t));
+}
+
+function isPostUrl(href) {
+    if (!href) return false;
+    // Reject search pages, navigation, and generic UI links
+    const bad = ['/hashtag/', '/friends/', '/login', '/recover', '/help',
+        '/settings', '/messages', '/marketplace', '/gaming',
+        '/events/', '/policies', 'facebook.com/sharer', 'facebook.com/home.php',
+        '/search/posts', '/search/top', '/search/', '/notifications'];
+    if (bad.some(b => href.includes(b))) return false;
+    const patterns = [
+        /\\/posts\\//i, /\\/permalink\\//i, /permalink\\.php/i, /story\\.php/i, /story_fbid=/i,
+        /\\/photos?\\//i, /photo\\.php/i, /[?&]fbid=\\d+/i, /\\/videos?\\//i, /video\\.php/i,
+        /\\/watch\\/?(\\?|.*v=)/i, /\\/reel\\//i, /\\/reels\\/[\\w]/i,
+        /\\/share\\/[pvr]\\//i, /\\/share\\/[A-Za-z0-9_-]{5,}/i,
+        /\\/groups\\/[^/]+\\/posts\\/\\d+/i, /\\/groups\\/[^/]+\\/permalink\\/\\d+/i,
+        /\\/multi_permalinks\\//i,
+        /pfbid[A-Za-z0-9]+/i
+    ];
+    return patterns.some(p => p.test(href));
+}
+
+// Find enclosing post container — climb up but STOP before reaching role="feed" or body
+let root = card;
+for (let i = 0; i < 5; i++) {
+    let p = root.parentElement;
+    if (!p || p.tagName === 'BODY' || p.getAttribute('role') === 'feed' || p.getAttribute('role') === 'main') {
+        break;
+    }
+    // Only climb if the parent is a div (skip nav, header, etc.)
+    if (p.tagName === 'DIV') {
+        root = p;
+    } else {
+        break;
+    }
+}
+
+// 1. Text
+let textDivs = root.querySelectorAll('div[dir="auto"]');
+let parts = [];
+for (let d of textDivs) {
+    let t = (d.innerText || d.textContent || '').trim();
+    if (t.length > 2) parts.push(t);
+}
+let fullText = parts.join('\\n');
+
+// 2. Links, Post URL, Timestamp
+let links = Array.from(root.querySelectorAll('a[href]'));
+let postUrl = '';
+let timestamp = '';
+
+for (let a of links) {
+    let href = a.href || a.getAttribute('href') || '';
+
+    // Skip the search results page URL itself
+    if (href.includes('/search/')) continue;
+    if (href.includes('/hashtag/')) continue;
+
+    let aria = (a.getAttribute('aria-label') || '').trim();
+    let title = (a.getAttribute('title') || '').trim();
+    let inner = (a.innerText || a.textContent || '').trim();
+    let utime = a.getAttribute('data-utime');
+
+    let ts = '';
+    if (utime && /^\\d+$/.test(utime)) {
+        try { ts = new Date(parseInt(utime) * 1000).toISOString(); } catch(e) {}
+    } else if (isValidTimestamp(aria)) {
+        ts = aria;
+    } else if (isValidTimestamp(title)) {
+        ts = title;
+    } else if (isValidTimestamp(inner)) {
+        ts = inner;
+    }
+
+    if (ts && !timestamp) {
+        timestamp = ts;
+        if (isPostUrl(href) && !postUrl) {
+            postUrl = href;
+        }
+    }
+
+    if (isPostUrl(href) && !postUrl) {
+        postUrl = href;
+    }
+}
+
+// 3. Author
+let author = '';
+let authorCandidates = root.querySelectorAll('h2 a, h3 a, h4 a, [role="heading"] a, strong a, a strong, span > strong, [data-ad-rendering-role="profile_name"], h2, h3, h4, [role="heading"]');
+for (let el of authorCandidates) {
+    let txt = (el.innerText || el.textContent || '').trim().split('\\n')[0].trim();
+    if (isValidAuthor(txt)) {
+        author = txt;
+        break;
+    }
+}
+if (!author) {
+    let imgs = root.querySelectorAll('img[alt*="profile" i], img[alt*="profile picture" i]');
+    for (let img of imgs) {
+        let alt = (img.getAttribute('alt') || '').replace(/(?:'s\\s+profile\\s+picture|profile\\s+picture\\s+of\\s+|profile\\s+of\\s+)/ig, '').trim();
+        if (isValidAuthor(alt)) {
+            author = alt;
+            break;
+        }
+    }
+}
+
+// 4. Media URLs
+let mediaUrls = [];
+let imgs = root.querySelectorAll('img');
+for (let img of imgs) {
+    let src = img.src || img.getAttribute('src') || '';
+    if (src && (src.includes('scontent') || src.includes('fbcdn'))) {
+        let w = img.width || img.naturalWidth || 0;
+        if (w >= 50 || (!img.width && !img.naturalWidth)) {
+            mediaUrls.push(src);
+        }
+    }
+}
+
+return {
+    fullText: fullText,
+    postUrl: postUrl,
+    timestamp: timestamp,
+    author: author,
+    mediaUrls: Array.from(new Set(mediaUrls))
+};
+"""
+
+
 def _expand_see_more(driver, article) -> None:
     """Click every 'See more' expander inside an article so the full
     text (including addresses and phone numbers) is captured."""
@@ -323,21 +489,80 @@ def _clean_facebook_url(url: str) -> str:
     if url.startswith("/"):
         url = "https://www.facebook.com" + url
 
+    # Unwrap Facebook redirects
+    if "facebook.com/l.php?" in url or "facebook.com/flx/warn/?" in url:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if "u" in qs:
+            url = qs["u"][0]
+
     try:
         parsed = urlparse(url)
-        # If it's a php script with query params, preserve essential identifiers
-        if any(p in parsed.path for p in ["permalink.php", "story.php", "photo.php", "video.php", "watch"]):
-            query_params = parse_qs(parsed.query)
-            essential_keys = ["story_fbid", "id", "fbid", "v", "comment_id", "theater", "set"]
-            kept = {k: v[0] for k, v in query_params.items() if k in essential_keys and v}
+        path_lower = parsed.path.lower()
+
+        # Check if URL relies on query parameters for post/media identification
+        needs_query_params = any(k in path_lower for k in [
+            "permalink.php", "story.php", "photo.php", "video.php", 
+            "photo", "watch", "media/set", "profile.php"
+        ])
+
+        query_params = parse_qs(parsed.query)
+        essential_keys = ["story_fbid", "id", "fbid", "v", "set", "post_id", "theater"]
+        kept = {k: v[0] for k, v in query_params.items() if k in essential_keys and v}
+
+        if needs_query_params and kept:
             clean_query = urlencode(kept)
-            return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", clean_query, ""))
+            clean_path = parsed.path.rstrip("/") if parsed.path != "/" else "/"
+            return urlunparse((parsed.scheme, parsed.netloc, clean_path, "", clean_query, ""))
         else:
-            # Clean path URL: strip ?__cft__... and tracking parameters
             clean_path = parsed.path.rstrip("/")
             return urlunparse((parsed.scheme, parsed.netloc, clean_path, "", "", ""))
     except Exception:
         return url.split("?")[0]
+
+
+def _is_post_url(href: str) -> bool:
+    """Check if a URL points directly to a post, video, reel, photo, or share permalink."""
+    if not href:
+        return False
+
+    # Exclude non-post and generic UI links
+    if any(bad in href for bad in [
+        "/hashtag/", "/friends/", "/login", "/recover", "/help", 
+        "/settings", "/messages", "/marketplace", "/gaming", 
+        "/events/", "/policies", "facebook.com/sharer", "facebook.com/home.php",
+        "/search/posts", "/search/top", "/search/", "/notifications"
+    ]):
+        return False
+
+    parsed = urlparse(href)
+    path = parsed.path.rstrip("/").lower()
+    if path in ["", "/", "/watch", "/reels", "/photos", "/videos", "/groups", "/stories"]:
+        if not parsed.query or not any(k in parsed.query for k in ["v=", "fbid=", "story_fbid="]):
+            return False
+
+    post_patterns = [
+        r"/posts/",
+        r"/permalink/",
+        r"permalink\.php",
+        r"story\.php",
+        r"story_fbid=",
+        r"/photos?/",
+        r"/photo\.php",
+        r"[?&]fbid=\d+",
+        r"/videos?/",
+        r"/video\.php",
+        r"/watch/?\?v=",
+        r"/reel/",
+        r"/reels/[\w]",
+        r"/share/[pvr]/",
+        r"/share/[A-Za-z0-9_-]{5,}",
+        r"/multi_permalinks/",
+        r"/groups/[^/]+/posts/\d+",
+        r"/groups/[^/]+/permalink/\d+",
+        r"pfbid[A-Za-z0-9]+",
+    ]
+    return any(re.search(pat, href, re.IGNORECASE) for pat in post_patterns)
 
 
 def _is_valid_author(name: str) -> bool:
@@ -394,11 +619,14 @@ def _is_valid_timestamp(text: str) -> bool:
 
 def _extract_author(driver, article) -> str:
     """Best-effort extraction of the posting author's name, avoiding hashtags."""
-    # 1. Look for headings (h2, h3, h4, h5, [role="heading"])
+    # 1. Look for headings (h2, h3, h4, h5, [role="heading"]) in element and ancestors
     try:
         headings = article.find_elements(By.CSS_SELECTOR, 'h2, h3, h4, h5, [role="heading"]')
+        if not headings:
+            headings = article.find_elements(By.XPATH, "./ancestor::div[position() <= 4]//h2 | ./ancestor::div[position() <= 4]//h3 | ./ancestor::div[position() <= 4]//h4 | ./ancestor::div[position() <= 4]//*[@role='heading']")
+
         for heading in headings:
-            links = heading.find_elements(By.CSS_SELECTOR, "a")
+            links = heading.find_elements(By.CSS_SELECTOR, "a, strong, span")
             for link in links:
                 txt = link.text.strip() or (link.get_attribute("innerText") or "").strip()
                 if _is_valid_author(txt):
@@ -410,23 +638,25 @@ def _extract_author(driver, article) -> str:
     except Exception:
         pass
 
-    # 2. Look for profile link in the header area (excluding hashtags/posts/photos)
+    # 2. Look for profile link / strong tag in the header area
     try:
-        links = article.find_elements(By.CSS_SELECTOR, "a[href]")
-        for link in links:
-            href = link.get_attribute("href") or ""
-            if any(seg in href for seg in [
-                "/hashtag/", "/posts/", "/permalink", "/photo", "/video", "/watch",
-                "/reel", "/events/", "/login", "/recover", "/help", "/sharer", "/friends"
-            ]):
-                continue
-
-            txt = link.text.strip() or (link.get_attribute("innerText") or "").strip()
-            if _is_valid_author(txt):
-                return txt
-            aria = (link.get_attribute("aria-label") or "").strip()
-            if _is_valid_author(aria):
-                return aria
+        selectors = [
+            '[data-ad-rendering-role="profile_name"]',
+            'strong a',
+            'a strong',
+            'span > strong',
+            'a[role="link"] > span > strong',
+            'a[role="link"][href]:not([href*="/posts/"]):not([href*="/photo"]):not([href*="/video"]):not([href*="/hashtag/"])',
+        ]
+        for sel in selectors:
+            links = article.find_elements(By.CSS_SELECTOR, sel)
+            for link in links:
+                txt = link.text.strip() or (link.get_attribute("innerText") or "").strip()
+                if _is_valid_author(txt):
+                    return txt
+                aria = (link.get_attribute("aria-label") or "").strip()
+                if _is_valid_author(aria):
+                    return aria
     except Exception:
         pass
 
@@ -449,18 +679,18 @@ def _extract_timestamp_and_url(driver, article, full_text: str = "") -> tuple[st
     timestamp = ""
     post_url = ""
 
-    # Strategy 1: Find post permalink and timestamp from post links
+    # Strategy 1: Find post permalink and timestamp from post links in element & ancestors
     try:
         links = article.find_elements(By.CSS_SELECTOR, "a[href]")
+        if not links:
+            links = article.find_elements(By.XPATH, "./ancestor::div[position() <= 4]//a[@href]")
+
         for link in links:
             href = link.get_attribute("href") or ""
             if not href or "/hashtag/" in href:
                 continue
 
-            is_post_link = any(seg in href for seg in [
-                "/posts/", "/permalink", "story_fbid=", "/videos/", "/watch",
-                "/reel/", "photo.php", "story.php", "fbid="
-            ])
+            is_post_link = _is_post_url(href)
 
             aria = (link.get_attribute("aria-label") or "").strip()
             title = (link.get_attribute("title") or "").strip()
@@ -482,6 +712,8 @@ def _extract_timestamp_and_url(driver, article, full_text: str = "") -> tuple[st
 
             if found_ts and not timestamp:
                 timestamp = found_ts
+                if is_post_link and not post_url:
+                    post_url = _clean_facebook_url(href)
 
             if is_post_link and not post_url:
                 post_url = _clean_facebook_url(href)
@@ -514,7 +746,7 @@ def _extract_timestamp_and_url(driver, article, full_text: str = "") -> tuple[st
     if not timestamp or any(rel in timestamp.lower() for rel in ["hr", "min", "ago", "yesterday", "d", "h", "m", "just now"]):
         try:
             header_links = article.find_elements(
-                By.CSS_SELECTOR, 'a[role="link"][href*="/posts/"], a[role="link"][href*="permalink"], span > a[role="link"]'
+                By.CSS_SELECTOR, 'a[role="link"][href*="/posts/"], a[role="link"][href*="permalink"], a[role="link"][href*="/share/"], span > a[role="link"]'
             )
             for hl in header_links[:2]:
                 try:
@@ -570,10 +802,9 @@ def extract_posts_from_page(
         _smooth_scroll(driver, pixels=random.randint(700, 1200))
         _human_pause(2.5, 5.0)
 
-        articles = driver.find_elements(By.CSS_SELECTOR, 'div[role="article"]')
+        articles = driver.find_elements(By.CSS_SELECTOR, 'div[role="feed"] > div, div[role="article"], [data-ad-preview], .userContentWrapper')
         if not articles:
-            # Fallback: try broader selectors used in some FB layouts
-            articles = driver.find_elements(By.CSS_SELECTOR, '[data-ad-preview], .userContentWrapper')
+            articles = driver.find_elements(By.CSS_SELECTOR, 'div[role="article"]')
 
         log.info(f"  scroll {scroll_i + 1}/{max_scrolls} — {len(articles)} article(s) visible  |  total saved: {len(all_reports)}")
 
@@ -582,7 +813,16 @@ def extract_posts_from_page(
                 # Expand truncated text
                 _expand_see_more(driver, article)
 
-                full_text = _extract_text(article)
+                # Primary extraction: execute optimized in-browser JavaScript
+                extracted_data = {}
+                try:
+                    extracted_data = driver.execute_script(JS_EXTRACT_POST, article) or {}
+                except Exception:
+                    extracted_data = {}
+
+                full_text = (extracted_data.get("fullText") or "").strip()
+                if not full_text:
+                    full_text = _extract_text(article)
                 if not full_text:
                     continue
 
@@ -595,9 +835,29 @@ def extract_posts_from_page(
                 if not _is_flood_relevant(full_text):
                     continue
 
-                # Extract metadata: Author, Timestamp, Post URL
-                timestamp, post_url = _extract_timestamp_and_url(driver, article, full_text)
-                author = _extract_author(driver, article)
+                # Extract Post URL & Timestamp
+                post_url = extracted_data.get("postUrl") or ""
+                timestamp = extracted_data.get("timestamp") or ""
+                author = extracted_data.get("author") or ""
+                media_urls = extracted_data.get("mediaUrls") or []
+
+                # Fallback to Python-level extractors if missing
+                if not post_url or not timestamp:
+                    py_timestamp, py_post_url = _extract_timestamp_and_url(driver, article, full_text)
+                    if not post_url:
+                        post_url = py_post_url
+                    if not timestamp:
+                        timestamp = py_timestamp
+
+                if not author or author == "Unknown":
+                    author = _extract_author(driver, article)
+
+                if not media_urls:
+                    media_urls = _extract_media_urls(article)
+
+                # Clean the post URL
+                if post_url:
+                    post_url = _clean_facebook_url(post_url)
 
                 if post_url and post_url in seen_urls:
                     continue
@@ -610,12 +870,12 @@ def extract_posts_from_page(
                 report = FloodReport(
                     post_id=text_hash[:12],
                     post_url=post_url,
-                    author=author,
+                    author=author or "Unknown",
                     timestamp=timestamp,
                     full_text=full_text,
                     detected_locations=_detect_locations(full_text),
                     urgency_level=_classify_urgency(full_text),
-                    media_urls=_extract_media_urls(article),
+                    media_urls=media_urls,
                     scraped_at=datetime.now(timezone.utc).isoformat(),
                 )
                 all_reports.append(report)
